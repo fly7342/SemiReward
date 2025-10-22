@@ -352,6 +352,8 @@ def build_semilearn_regression_pipeline(
     )
 
     algorithm_instance = get_algorithm(config, net_spec.builder, tb_log=None, logger=None)
+    if getattr(algorithm_instance, "task_type", None) == "reg" and not hasattr(algorithm_instance, "range"):
+        setattr(algorithm_instance, "range", label_range)
 
     return RegressionPipelineArtifacts(
         config=config,
