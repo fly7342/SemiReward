@@ -271,7 +271,11 @@ def build_semilearn_regression_pipeline(
         "dataset": "poly_regression_demo",
         "save_dir": "./saved_models",
         "save_name": f"{algorithm}_poly_regression",
-        "gpu": 0,
+        "gpu": 0 if torch.cuda.is_available() else None,
+        "distributed": False,
+        "rank": 0,
+        "world_size": 1,
+        "multiprocessing_distributed": False,
         "num_workers": 0,
         "seed": seed,
     }
@@ -290,6 +294,20 @@ def build_semilearn_regression_pipeline(
         base_config.update(config_overrides)
 
     config = get_config(base_config)
+
+    # ``get_config`` mirrors the command line interface used in the reference
+    # training scripts where distributed attributes are populated after
+    # argument parsing.  When building a configuration programmatically we need
+    # to ensure those attributes exist so that algorithm constructors relying
+    # on them (e.g. ``AlgorithmBase``) behave as expected.
+    if not hasattr(config, "distributed"):
+        config.distributed = False
+    if not hasattr(config, "rank"):
+        config.rank = 0
+    if not hasattr(config, "world_size"):
+        config.world_size = 1
+    if not hasattr(config, "multiprocessing_distributed"):
+        config.multiprocessing_distributed = False
 
     lb_features, lb_targets, ulb_features, _ = split_ssl_data(
         config,
