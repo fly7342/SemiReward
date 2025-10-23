@@ -58,11 +58,14 @@ class SRPseudoLabel(AlgorithmBase):
     def _clip_regression_values(self, tensor):
         if self.task_type != 'cls':
             max_index = float(self.range - 1)
+            tensor = torch.nan_to_num(tensor, nan=0.0, posinf=max_index, neginf=0.0)
             tensor = torch.clamp(tensor, min=0.0, max=max_index)
         return tensor
 
     def _clip_label_indices(self, tensor):
         tensor = self._clip_regression_values(tensor)
+        if self.task_type != 'cls':
+            tensor = torch.round(tensor)
         return tensor.long()
 
     def _format_targets_for_loss(self, targets, reference):

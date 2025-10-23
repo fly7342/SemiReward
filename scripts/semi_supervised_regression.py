@@ -289,6 +289,11 @@ def build_semilearn_regression_pipeline(
             "sr_ema": False,
             "sr_ema_m": 0.99,
         })
+        total_iters = base_config["num_train_iter"]
+        warmup_target = max(base_config["start_timing"], int(0.6 * total_iters))
+        if warmup_target >= total_iters:
+            warmup_target = max(total_iters - max(1, total_iters // 10), 1)
+        base_config["start_timing"] = warmup_target
 
     if config_overrides:
         base_config.update(config_overrides)
