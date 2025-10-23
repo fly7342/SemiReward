@@ -36,6 +36,7 @@ except ImportError as exc:
 
 import itertools
 import math
+from inspect import signature
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -112,7 +113,13 @@ class RegressionLabelScaler:
 class RegressionLabeledDataset(Dataset):
     """Torch dataset returning semilearn-style labeled batches."""
 
-    def __init__(self, features: np.ndarray, targets: np.ndarray):
+    def __init__(
+        self,
+        features: np.ndarray,
+        targets: np.ndarray,
+        weak_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        strong_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ):
         if len(features) != len(targets):
             raise ValueError("Features and targets must contain the same number of samples")
         self.features = torch.as_tensor(features, dtype=torch.float32)
@@ -120,25 +127,68 @@ class RegressionLabeledDataset(Dataset):
         if targets.ndim == 1:
             targets = targets.unsqueeze(-1)
         self.targets = targets
+        self.weak_transform = weak_transform
+        self.strong_transform = strong_transform or weak_transform
 
     def __len__(self) -> int:
         return self.features.shape[0]
 
+    @staticmethod
+    def _apply_transform(x: torch.Tensor, transform: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> torch.Tensor:
+        if transform is None:
+            return x
+        transformed = transform(x.clone())
+        if not isinstance(transformed, torch.Tensor):
+            transformed = torch.as_tensor(transformed, dtype=x.dtype)
+        return transformed.to(dtype=x.dtype)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {"x_lb": self.features[idx], "y_lb": self.targets[idx]}
+        feature = self.features[idx]
+        target = self.targets[idx]
+        weak_view = self._apply_transform(feature, self.weak_transform)
+        strong_view = self._apply_transform(feature, self.strong_transform)
+        return {
+            "idx_lb": torch.tensor(idx, dtype=torch.long),
+            "x_lb": weak_view,
+            "x_lb_s": strong_view,
+            "y_lb": target,
+        }
 
 
 class RegressionUnlabeledDataset(Dataset):
     """Torch dataset returning semilearn-style unlabeled batches."""
 
-    def __init__(self, features: np.ndarray):
+    def __init__(
+        self,
+        features: np.ndarray,
+        weak_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        strong_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ):
         self.features = torch.as_tensor(features, dtype=torch.float32)
+        self.weak_transform = weak_transform
+        self.strong_transform = strong_transform or weak_transform
+
+    @staticmethod
+    def _apply_transform(x: torch.Tensor, transform: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> torch.Tensor:
+        if transform is None:
+            return x
+        transformed = transform(x.clone())
+        if not isinstance(transformed, torch.Tensor):
+            transformed = torch.as_tensor(transformed, dtype=x.dtype)
+        return transformed.to(dtype=x.dtype)
 
     def __len__(self) -> int:
         return self.features.shape[0]
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {"x_ulb_w": self.features[idx]}
+        feature = self.features[idx]
+        weak_view = self._apply_transform(feature, self.weak_transform)
+        strong_view = self._apply_transform(feature, self.strong_transform)
+        return {
+            "idx_ulb": torch.tensor(idx, dtype=torch.long),
+            "x_ulb_w": weak_view,
+            "x_ulb_s": strong_view,
+        }
 
 
 class RegressionMLP(nn.Module):
@@ -390,6 +440,15 @@ class RegressionTrainer:
         self.algorithm.optimizer.zero_grad(set_to_none=True)
         self.algorithm.it = 0
         self.algorithm.epoch = 0
+        self._train_step_args = list(signature(self.algorithm.train_step).parameters.keys())
+
+    @staticmethod
+    def _to_device(value: object, device: torch.device) -> object:
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {k: RegressionTrainer._to_device(v, device) for k, v in value.items()}
+        return value
 
     def fit(
         self,
@@ -405,12 +464,16 @@ class RegressionTrainer:
             epoch_losses: List[float] = []
             for batch_lb in train_lb_loader:
                 batch_ulb = next(ulb_cycle)
-                x_lb = batch_lb["x_lb"].to(self.device)
-                y_lb = batch_lb["y_lb"].to(self.device)
-                x_ulb = batch_ulb["x_ulb_w"].to(self.device)
+                merged_batch = {**batch_lb, **batch_ulb}
+                selected_inputs = {arg: merged_batch[arg] for arg in self._train_step_args if arg in merged_batch}
+
+                if torch.cuda.is_available() and getattr(self.algorithm, "gpu", None) is not None:
+                    input_tensors = self.algorithm.process_batch(self._train_step_args, **selected_inputs)
+                else:
+                    input_tensors = {k: self._to_device(v, self.device) for k, v in selected_inputs.items()}
 
                 self.algorithm.optimizer.zero_grad(set_to_none=True)
-                out_dict, _ = self.algorithm.train_step(x_lb=x_lb, y_lb=y_lb, x_ulb_w=x_ulb)
+                out_dict, _ = self.algorithm.train_step(**input_tensors)
                 loss = out_dict["loss"]
                 loss.backward()
                 if getattr(self.algorithm, "clip_grad", 0.0) and self.algorithm.clip_grad > 0.0:
