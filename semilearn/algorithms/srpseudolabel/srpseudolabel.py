@@ -35,9 +35,16 @@ class SRPseudoLabel(AlgorithmBase):
         super().__init__(args, net_builder, tb_log, logger, **kwargs)
         self.init(p_cutoff=args.p_cutoff, unsup_warm_up=args.unsup_warm_up)
         self.task_type = args.task_type
+        if self.task_type == 'cls':
+            self.range = self.num_classes
+        else:
+            self.range = int(getattr(args, 'range', getattr(self, 'range', 1)))
+        self.range = max(1, self.range)
         self.N_k = args.N_k
-        self.rewarder = send_model_cuda(args, Rewarder(label_dim(self.num_classes), 128, args.feature_dim)) if args.sr_ema == 0 \
-                        else send_model_cuda(args, EMARewarder(label_dim(self.num_classes), 128, feature_dim=args.feature_dim, ema_decay=args.sr_ema_m), clip_batch=False)
+        label_extent = self.num_classes if self.task_type == 'cls' else self.range
+        rewarder_label_dim = label_dim(label_extent)
+        self.rewarder = send_model_cuda(args, Rewarder(rewarder_label_dim, 128, args.feature_dim)) if args.sr_ema == 0 \
+                        else send_model_cuda(args, EMARewarder(rewarder_label_dim, 128, feature_dim=args.feature_dim, ema_decay=args.sr_ema_m), clip_batch=False)
         self.generator = send_model_cuda(args, Generator(args.feature_dim))
         self.start_timing = args.start_timing
 
@@ -47,6 +54,27 @@ class SRPseudoLabel(AlgorithmBase):
         self.criterion = torch.nn.MSELoss()
 
         self.max_reward = -float('inf')
+
+    def _clip_regression_values(self, tensor):
+        if self.task_type != 'cls':
+            max_index = float(self.range - 1)
+            tensor = torch.nan_to_num(tensor, nan=0.0, posinf=max_index, neginf=0.0)
+            tensor = torch.clamp(tensor, min=0.0, max=max_index)
+        return tensor
+
+    def _clip_label_indices(self, tensor):
+        tensor = self._clip_regression_values(tensor)
+        if self.task_type != 'cls':
+            tensor = torch.round(tensor)
+        return tensor.long()
+
+    def _format_targets_for_loss(self, targets, reference):
+        if self.task_type == 'cls':
+            return targets
+        targets = self._clip_regression_values(targets)
+        if targets.ndim < reference.ndim:
+            targets = targets.view(reference.shape[0], -1)
+        return targets.to(reference.dtype)
     def init(self, p_cutoff, unsup_warm_up=0.4):
         self.p_cutoff = p_cutoff
         self.unsup_warm_up = unsup_warm_up 
@@ -77,14 +105,16 @@ class SRPseudoLabel(AlgorithmBase):
             # compute mask
                 mask = self.call_hook("masking", "MaskingHook", logits_x_ulb=logits_x_ulb.detach())
             # generate unlabeled targets using pseudo label hook
-                pseudo_label = self.call_hook("gen_ulb_targets", "PseudoLabelingHook", 
+                pseudo_label = self.call_hook("gen_ulb_targets", "PseudoLabelingHook",
                                           logits=logits_x_ulb.detach() if self.task_type == 'cls' else outs_x_ulb_pseudo.detach() ,
                                           use_hard_label=True)
-                                          
-            reward = rewarder(feats_x_ulb, pseudo_label)
+                loss_targets = self._format_targets_for_loss(pseudo_label, logits_x_ulb if self.task_type == 'cls' else outs_x_ulb_pseudo)
+                safe_pseudo_label = self._clip_label_indices(pseudo_label)
+
+            reward = rewarder(feats_x_ulb, safe_pseudo_label)
             avg_reward=reward.mean()
             mask2 = torch.where(reward >= avg_reward, torch.tensor(1).cuda(gpu), torch.tensor(0).cuda(gpu)).squeeze().float()
-            unsup_loss = self.consistency_loss(logits_x_ulb if self.task_type == 'cls' else logits_x_ulb, pseudo_label, name='ce' if self.task_type == 'cls' else 'l1', mask=mask,mask2=mask2)
+            unsup_loss = self.consistency_loss(logits_x_ulb if self.task_type == 'cls' else logits_x_ulb, loss_targets if self.task_type != 'cls' else pseudo_label, name='ce' if self.task_type == 'cls' else 'l1', mask=mask,mask2=mask2)
         unsup_loss = unsup_loss
 
         return unsup_loss
@@ -119,15 +149,17 @@ class SRPseudoLabel(AlgorithmBase):
             mask = self.call_hook("masking", "MaskingHook", logits_x_ulb=logits_x_ulb.detach())
 
             # generate unlabeled targets using pseudo label hook
-            pseudo_label = self.call_hook("gen_ulb_targets", "PseudoLabelingHook", 
+            pseudo_label = self.call_hook("gen_ulb_targets", "PseudoLabelingHook",
                                           logits=logits_x_ulb.detach() if self.task_type == 'cls' else logits_x_ulb.detach(),
                                           use_hard_label=True)
+            loss_targets = self._format_targets_for_loss(pseudo_label, logits_x_ulb)
+            safe_pseudo_label = self._clip_label_indices(pseudo_label)
             # SemiReward inference
             if self.it > self.start_timing:
                 rewarder = self.rewarder
                 unsup_loss = self.data_generator( x_ulb_w, rewarder,self.gpu)
             else:
-                unsup_loss = self.consistency_loss(logits_x_ulb if self.task_type == 'cls' else logits_x_ulb, pseudo_label,
+                unsup_loss = self.consistency_loss(logits_x_ulb if self.task_type == 'cls' else logits_x_ulb, loss_targets if self.task_type != 'cls' else pseudo_label,
                                                name='ce' if self.task_type == 'cls' else 'l1',
                                                mask=mask)
 
@@ -137,29 +169,30 @@ class SRPseudoLabel(AlgorithmBase):
                 self.rewarder.train()
                 self.generator.train()
                 generated_label = self.generator(feats_x_lb.detach())
-                generated_label=generated_label.long()
+                generated_label=self._clip_label_indices(generated_label)
             # Convert generated pseudo labels and true labels to tensors
-                real_labels_tensor = y_lb.cuda(self.gpu)          
+                real_labels_tensor = y_lb.cuda(self.gpu)
+                real_labels_tensor = self._clip_label_indices(real_labels_tensor)
                 reward = self.rewarder(feats_x_lb.detach(),generated_label.squeeze(1))
                 if self.it >= self.start_timing:
-                    filtered_pseudo_labels = pseudo_label.long()
+                    filtered_pseudo_labels = safe_pseudo_label
                     filtered_feats_x_ulb = feats_x_ulb.detach()
                     rewarder = self.rewarder.eval()
-                    
-                    reward = self.rewarder(feats_x_ulb.detach(), pseudo_label.long())
+
+                    reward = self.rewarder(feats_x_ulb.detach(), safe_pseudo_label)
                     reward = reward.mean()
                     self.max_reward = torch.where(reward > self.max_reward, reward, self.max_reward)
-                    filtered_pseudo_labels = torch.where(reward > self.max_reward, pseudo_label.detach(), filtered_pseudo_labels)
+                    filtered_pseudo_labels = torch.where(reward > self.max_reward, safe_pseudo_label.detach(), filtered_pseudo_labels)
                     filtered_feats_x_ulb = torch.where(reward > self.max_reward, feats_x_ulb.detach(), filtered_feats_x_ulb)
                     if self.it % self.N_k == 0 and self.it > self.start_timing:
                         self.max_reward = -float('inf')
                         self.rewarder.train()
                         self.generator.train()
                         generated_label = self.generator(filtered_feats_x_ulb.squeeze(1))
-                        generated_label=generated_label.long()
+                        generated_label=self._clip_label_indices(generated_label)
                         reward = self.rewarder(filtered_feats_x_ulb, generated_label.squeeze(1))
-                        generated_label = F.one_hot(generated_label.squeeze(1), num_classes=self.num_classes)
-                        filtered_pseudo_labels= F.one_hot(filtered_pseudo_labels.long(), num_classes=self.num_classes)
+                        generated_label = F.one_hot(generated_label.squeeze(1), num_classes=self.num_classes if self.task_type == 'cls' else self.range)
+                        filtered_pseudo_labels= F.one_hot(filtered_pseudo_labels.long(), num_classes=self.num_classes if self.task_type == 'cls' else self.range)
                         cosine_similarity_score = cosine_similarity_n(generated_label.float(), filtered_pseudo_labels.float())
                         generator_loss = self.criterion(reward, torch.ones_like(reward).cuda(self.gpu))
                         rewarder_loss = self.criterion(reward, cosine_similarity_score)
